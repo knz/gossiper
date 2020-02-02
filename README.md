@@ -24,8 +24,11 @@ Each node offers the following API over HTTP:
 - `/` (browser index page): a HTML page reporting the current
   database.
 
-- `/hello`: the liveness map in a precise textual format — this is
-  used by peers to run the gossip protocol. Example output:
+- `/hello`: the liveness map in a precise textual format.  This is
+  used in the peer-to-peer gossip protocol but can also serve
+  interactive demos using `curl` in the terminal.
+
+  Example output:
 
   ```
   hello!
