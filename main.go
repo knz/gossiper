@@ -13,7 +13,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
+
+// myID is the ID of this node.
+var myID string
 
 // myAddr is the public address of the server.
 var myAddr string
@@ -24,51 +29,104 @@ var state struct {
 	// livePeers indicates for each peer the time of last successful
 	// heartbeat. The timestamp is zero (default time.Time) if the peer
 	// is known but hasn't heartbeated yet.
-	livePeers map[string]time.Time
+	livePeers  map[string]time.Time
+	decoPeers  map[string]struct{}
+	knownAddrs map[string]struct{}
 }
 
 func init() {
+	state.decoPeers = map[string]struct{}{}
+	state.knownAddrs = map[string]struct{}{}
 	state.livePeers = map[string]time.Time{}
 }
 
-func maybeAddPeer(peer string, isLive bool) {
+func addPeerAddr(peerAddr string) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.knownAddrs[peerAddr] = struct{}{}
+}
+
+func pingPeer(peerID string) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
-	ts := state.livePeers[peer]
-	if isLive {
-		log.Printf("peer is live: %s", peer)
-		ts = time.Now()
+	ts := time.Now()
+	if t := state.livePeers[peerID]; ts.Sub(t) > 1*time.Second {
+		// We avoid refreshing a ping that's newer than 1 second
+		// to avoid spamming the logging output when the same
+		// node responds through multiple addresses.
+		log.Printf("peer is live: %s", peerID)
 	}
-	state.livePeers[peer] = ts
+	state.livePeers[peerID] = ts
+}
+
+func decoPeer(peerID string) {
+	if peerID == myID {
+		fmt.Printf("received request to disconnect\n")
+		os.Exit(0)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.decoPeers[peerID] = struct{}{}
+}
+
+func knownPeer(peerID string) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if _, ok := state.decoPeers[peerID]; ok {
+		return
+	}
+	t := state.livePeers[peerID]
+	state.livePeers[peerID] = t
+}
+
+// Handler for the /bye API.
+func byeHandler(w http.ResponseWriter, req *http.Request) {
+	options := req.URL.Query()
+	nodeID := options.Get("id")
+	if nodeID != "" {
+		decoPeer(nodeID)
+	}
 }
 
 // Handler for the /hello API.
 func helloHandler(w http.ResponseWriter, req *http.Request) {
-	from := req.URL.Query().Get("from")
+	options := req.URL.Query()
+	from := options.Get("from")
 	if from != "" {
-		maybeAddPeer(from, true /*isLive*/)
+		pingPeer(from)
+		peerAddr := options.Get("via")
+		if peerAddr != "" {
+			addPeerAddr(peerAddr)
+		}
 	}
 
 	w.Header().Add("Content-Type", "text/plain")
-	io.WriteString(w, "hello!\n+ ")
-	io.WriteString(w, myAddr)
-	io.WriteString(w, "\n")
+	fmt.Fprintf(w, "hello %s\n", myID)
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	for peer, t := range state.livePeers {
+	comma := ""
+	for peerID := range state.livePeers {
+		if peerID == myID {
+			continue
+		}
+		io.WriteString(w, comma)
+		io.WriteString(w, peerID)
+		comma = " "
+	}
+	io.WriteString(w, "\n")
+	comma = ""
+	for peerID := range state.decoPeers {
+		io.WriteString(w, comma)
+		io.WriteString(w, peerID)
+		comma = " "
+	}
+	io.WriteString(w, "\n")
+	io.WriteString(w, myAddr)
+	io.WriteString(w, "\n")
+	for peer := range state.knownAddrs {
 		if peer == myAddr {
 			continue
-		}
-		var zeroTime time.Time
-		if t == zeroTime {
-			// This peer has never heartbeaten yet. We don't know them.
-			continue
-		}
-		if time.Now().Sub(t) < 5*time.Second {
-			io.WriteString(w, "+ ")
-		} else {
-			io.WriteString(w, "- ")
 		}
 		io.WriteString(w, peer)
 		io.WriteString(w, "\n")
@@ -79,30 +137,39 @@ func helloHandler(w http.ResponseWriter, req *http.Request) {
 func statusHandler(w http.ResponseWriter, req *http.Request) {
 	w.Header().Add("Content-Type", "text/html")
 	io.WriteString(w, "<html><body><p>This is node: ")
-	io.WriteString(w, myAddr)
-	io.WriteString(w, "</p><table border=1><thead><tr><th>peer</th><th>last seen</th><th>live?</th></tr></thead><tbody>")
+	fmt.Fprintf(w, "%s (%s)", myID, myAddr)
+	io.WriteString(w, "</p><table border=1><thead><tr><th>peer</th><th>last seen</th><th>live?</th></tr></thead><tbody>\n")
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	for peer, t := range state.livePeers {
+		if _, ok := state.decoPeers[peer]; ok {
+			// Node is known-removed.
+			continue
+		}
 		isLive := time.Now().Sub(t) < 5*time.Second
 		fmt.Fprintf(w, "<tr><td>%s</td><td>%v</td><td>%v</td></tr>\n",
 			peer, t, isLive)
 	}
-	io.WriteString(w, "</tbody></table></body></html>\n")
+	io.WriteString(w, "</tbody></table><p>Peer addresses:</p><ul>\n")
+	for p := range state.knownAddrs {
+		fmt.Fprintf(w, "<li>%s</li>\n", p)
+	}
+	io.WriteString(w, "</ul></body></html>\n")
 }
 
 // heartBeats runs in the background to update the liveness.
 func heartBeats() {
 	for {
 		time.Sleep(2 * time.Second)
+		pingPeer(myID)
 		checkAll()
 	}
 }
 
 func checkAll() {
 	state.mu.Lock()
-	candidates := make([]string, 0, len(state.livePeers))
-	for s := range state.livePeers {
+	candidates := make([]string, 0, len(state.knownAddrs))
+	for s := range state.knownAddrs {
 		candidates = append(candidates, s)
 	}
 	state.mu.Unlock()
@@ -117,6 +184,18 @@ func checkAll() {
 		}()
 	}
 	wg.Wait()
+
+	state.mu.Lock()
+	now := time.Now()
+	for peerID, t := range state.livePeers {
+		if _, ok := state.decoPeers[peerID]; ok {
+			continue
+		}
+		if now.Sub(t) > 5*time.Second {
+			log.Printf("peer is dead: %s", peerID)
+		}
+	}
+	state.mu.Unlock()
 }
 
 func checkOne(srv string) {
@@ -124,7 +203,7 @@ func checkOne(srv string) {
 		context.Background(), 1*time.Second)
 	defer cleanup()
 
-	url := "http://" + srv + "/hello?from=" + myAddr
+	url := "http://" + srv + "/hello?from=" + myID + "&via=" + myAddr
 	req, err := http.NewRequestWithContext(timeoutCtx, "GET", url, nil)
 	if err != nil {
 		log.Printf("http: %s: %v", srv, err)
@@ -145,32 +224,31 @@ func checkOne(srv string) {
 		return
 	}
 	parts := strings.Split(string(bytes), "\n")
-	if len(parts) == 0 || parts[0] != "hello!" {
+	if len(parts) < 3 || !strings.HasPrefix(parts[0], "hello ") {
 		log.Printf("invalid response: %s: %v", srv, parts)
 		return
 	}
+	peerID := parts[0][6:]
+	pingPeer(peerID)
+	for _, peerID := range strings.Split(parts[1], " ") {
+		knownPeer(peerID)
+	}
+	for _, peerID := range strings.Split(parts[2], " ") {
+		decoPeer(peerID)
+	}
 
 	// Now also discover everyone else it knows about.
-	for i, line := range parts[1:] {
+	for _, line := range parts[3:] {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		if !strings.HasPrefix(line, "+ ") && !strings.HasPrefix(line, "- ") {
-			log.Printf("invalid format: %s: %s", srv, line)
-			continue
-		}
-		maybeAddr := line[2:]
-		_, _, err := net.SplitHostPort(maybeAddr)
+		_, _, err := net.SplitHostPort(line)
 		if err != nil {
-			log.Printf("invalid format: %s: %s: %v", srv, maybeAddr, err)
+			log.Printf("invalid format: %s: %s: %v", srv, line, err)
 			continue
 		}
-		// The first line in the response has true liveness.
-		// For every other line, the liveness bit may be
-		// out of date now. Ignore it. Our own heartBeat will figure that
-		// out later.
-		maybeAddPeer(maybeAddr, i == 0 /*isLive*/)
+		addPeerAddr(line)
 	}
 }
 
@@ -182,6 +260,7 @@ var myHostname = func() string {
 	return s
 }()
 
+var nodeID = flag.String("id", uuid.MakeV4().Short(), "node ID")
 var advAddr = flag.String("advertise", myHostname, "host to advertise")
 var portNum = flag.Int("port", 8080, "port number to listen on")
 var join = flag.String("join", "", "server to join")
@@ -189,7 +268,11 @@ var join = flag.String("join", "", "server to join")
 func main() {
 	flag.Parse()
 
+	myID = *nodeID
+	pingPeer(myID)
+
 	http.HandleFunc("/hello", helloHandler)
+	http.HandleFunc("/bye", byeHandler)
 	http.HandleFunc("/", statusHandler)
 
 	portPart := fmt.Sprintf(":%d", *portNum)
@@ -200,7 +283,7 @@ func main() {
 		if s == "" {
 			continue
 		}
-		maybeAddPeer(s, false /*isLive*/)
+		addPeerAddr(s)
 	}
 
 	ln, err := net.Listen("tcp", portPart)
