@@ -62,7 +62,7 @@ func pingPeer(peerID string) {
 
 func decoPeer(peerID string) {
 	if peerID == myID {
-		fmt.Printf("received request to disconnect\n")
+		log.Printf("received request to disconnect\n")
 		os.Exit(0)
 	}
 	state.mu.Lock()
